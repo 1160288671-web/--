@@ -1,13 +1,36 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import ReactMarkdown from 'react-markdown'
-import { fetchConfig, fetchUrlText, parseModelReply, sendChat } from '@/lib/api'
+import {
+  fetchConfig,
+  fetchUrlText,
+  getPlan,
+  parseModelReply,
+  planHtmlUrl,
+  renderPlan,
+  sendChat,
+} from '@/lib/api'
 import type { ApiMessage, ChatTurn, ModelReply } from '@/types'
 import { ROUND_LABELS } from '@/types'
 import ProfilePanel from '@/components/travel/ProfilePanel'
+import PlanViewer from '@/components/travel/PlanViewer'
+import ProfileCarousel from '@/components/travel/ProfileCarousel'
+import HistoryDrawer from '@/components/travel/HistoryDrawer'
 import { Button } from '@/components/ui/button'
 import { Textarea } from '@/components/ui/textarea'
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card'
 import { ScrollArea } from '@/components/ui/scroll-area'
+
+function messageToTurn(m: ApiMessage): ChatTurn {
+  if (m.role === 'user') {
+    return {
+      role: 'user',
+      text: m.content === '[GENERATE_PLAN]' ? '📝 生成我的旅行方案' : m.content,
+      raw: m.content,
+    }
+  }
+  const p = parseModelReply(m.content)
+  return { role: 'assistant', text: p.reply, raw: m.content, options: p.options, round: p.round }
+}
 
 export default function Home() {
   const [turns, setTurns] = useState<ChatTurn[]>([])
@@ -16,31 +39,45 @@ export default function Home() {
   const [readyForPlan, setReadyForPlan] = useState(false)
   const [plan, setPlan] = useState<string | null>(null)
   const [planVersion, setPlanVersion] = useState(0)
+  const [destination, setDestination] = useState('')
   const [input, setInput] = useState('')
   const [loading, setLoading] = useState(false)
+  const [generating, setGenerating] = useState(false)
   const [error, setError] = useState<string | null>(null)
   const [hasKey, setHasKey] = useState<boolean | null>(null)
   const [model, setModel] = useState('')
-  const bottomRef = useRef<HTMLDivElement>(null)
+  const [viewerUrl, setViewerUrl] = useState<string | null>(null)
+  const [historyOpen, setHistoryOpen] = useState(false)
+  const [currentArchiveId, setCurrentArchiveId] = useState<string | null>(null)
 
-  const applyReply = useCallback((raw: string, allTurns: ChatTurn[]) => {
-    const parsed: ModelReply = parseModelReply(raw)
-    if (parsed.profile) {
-      setProfile((p) => ({ ...p, ...parsed.profile }))
-    }
-    if (typeof parsed.round === 'number') setRound(parsed.round)
-    if (parsed.ready_for_plan) setReadyForPlan(true)
-    if (parsed.plan) setPlan(parsed.plan)
-    if (parsed.plan_version) setPlanVersion(parsed.plan_version)
-    const turn: ChatTurn = {
-      role: 'assistant',
-      text: parsed.plan ? parsed.reply : parsed.reply,
-      raw,
-      options: parsed.options,
-      round: parsed.round,
-    }
-    setTurns([...allTurns, turn])
-  }, [])
+  const bottomRef = useRef<HTMLDivElement>(null)
+  const profileRef = useRef<Record<string, string>>({})
+  const destinationRef = useRef('')
+
+  const savePlan = useCallback(
+    async (parsed: ModelReply, assistantTurn: ChatTurn, allTurns: ChatTurn[]) => {
+      const fullTurns = [...allTurns, assistantTurn]
+      const messages: ApiMessage[] = fullTurns.map((t) => ({ role: t.role, content: t.raw }))
+      const lastUser = [...allTurns].reverse().find((t) => t.role === 'user')
+      try {
+        const result = await renderPlan({
+          id: currentArchiveId || undefined,
+          destination: parsed.destination || destinationRef.current || '我的旅行',
+          profile: profileRef.current,
+          planMarkdown: parsed.plan || '',
+          planVersion: parsed.plan_version || 1,
+          mapPoints: parsed.map_points || [],
+          messages,
+          lastUserMessage: lastUser?.text,
+        })
+        setCurrentArchiveId(result.id)
+        setViewerUrl(planHtmlUrl(result.id))
+      } catch (e) {
+        setError(`方案已生成，但网页保存失败：${e instanceof Error ? e.message : String(e)}`)
+      }
+    },
+    [currentArchiveId],
+  )
 
   const ask = useCallback(
     async (allTurns: ChatTurn[]) => {
@@ -49,14 +86,41 @@ export default function Home() {
       try {
         const messages: ApiMessage[] = allTurns.map((t) => ({ role: t.role, content: t.raw }))
         const raw = await sendChat(messages)
-        applyReply(raw, allTurns)
+        const parsed: ModelReply = parseModelReply(raw)
+
+        if (parsed.profile) {
+          profileRef.current = { ...profileRef.current, ...parsed.profile }
+          setProfile((p) => ({ ...p, ...parsed.profile }))
+        }
+        if (typeof parsed.round === 'number') setRound(parsed.round)
+        if (parsed.ready_for_plan) setReadyForPlan(true)
+        if (parsed.destination) {
+          destinationRef.current = parsed.destination
+          setDestination(parsed.destination)
+        }
+
+        const turn: ChatTurn = {
+          role: 'assistant',
+          text: parsed.reply,
+          raw,
+          options: parsed.options,
+          round: parsed.round,
+        }
+        setTurns([...allTurns, turn])
+
+        if (parsed.plan) {
+          setPlan(parsed.plan)
+          setPlanVersion(parsed.plan_version || 1)
+          await savePlan(parsed, turn, allTurns)
+        }
       } catch (e) {
         setError(e instanceof Error ? e.message : String(e))
       } finally {
         setLoading(false)
+        setGenerating(false)
       }
     },
-    [applyReply],
+    [savePlan],
   )
 
   // 初始化：检查配置并自动开场
@@ -92,6 +156,7 @@ export default function Home() {
     const t = text.trim()
     if (!t || loading) return
     setInput('')
+    if (plan) setGenerating(true) // 迭代阶段，回复会是新方案
     let raw = t
     const urlMatch = t.match(/https?:\/\/[^\s，。)）]+/)
     if (urlMatch) {
@@ -109,6 +174,7 @@ export default function Home() {
 
   const generatePlan = () => {
     if (loading) return
+    setGenerating(true)
     const next: ChatTurn[] = [
       ...turns,
       { role: 'user', text: '📝 生成我的旅行方案', raw: '[GENERATE_PLAN]' },
@@ -117,7 +183,41 @@ export default function Home() {
     ask(next)
   }
 
+  const continuePlan = async (id: string) => {
+    try {
+      const a = await getPlan(id)
+      profileRef.current = a.profile
+      destinationRef.current = a.destination
+      setProfile(a.profile)
+      setDestination(a.destination)
+      setPlan(a.planMarkdown)
+      setPlanVersion(a.planVersion)
+      setCurrentArchiveId(a.id)
+      setReadyForPlan(true)
+      setRound(4)
+      setTurns(a.messages.map(messageToTurn))
+      setViewerUrl(null)
+      setHistoryOpen(false)
+      setError(null)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
+  const viewArchive = async (id: string) => {
+    try {
+      const a = await getPlan(id)
+      setDestination(a.destination)
+      setPlanVersion(a.planVersion)
+      setViewerUrl(planHtmlUrl(id))
+      setHistoryOpen(false)
+    } catch (e) {
+      setError(e instanceof Error ? e.message : String(e))
+    }
+  }
+
   const lastAssistant = [...turns].reverse().find((t) => t.role === 'assistant')
+  const showReminder = readyForPlan && !plan && !loading
 
   return (
     <div className="min-h-screen bg-gradient-to-br from-amber-50 via-orange-50 to-sky-50">
@@ -127,6 +227,9 @@ export default function Home() {
           <div className="flex items-center gap-3 text-xs text-muted-foreground">
             {model && <span>模型：{model}</span>}
             {hasKey === false && <span className="text-red-500 font-medium">未配置 API Key</span>}
+            <Button variant="outline" size="sm" onClick={() => setHistoryOpen(true)}>
+              🗂️ 历史方案
+            </Button>
           </div>
         </div>
       </header>
@@ -137,7 +240,7 @@ export default function Home() {
           {hasKey === false && (
             <Card className="border-red-200 bg-red-50/70">
               <CardHeader className="pb-2">
-                <CardTitle className="text-base">🔑 需要先配置 Kimi API Key</CardTitle>
+                <CardTitle className="text-base">🔑 需要先配置 API Key</CardTitle>
               </CardHeader>
               <CardContent className="text-sm space-y-1">
                 <p>1. 到 <a className="text-blue-600 underline" href="https://platform.moonshot.cn/console/api-keys" target="_blank" rel="noreferrer">platform.moonshot.cn</a> 创建 API Key</p>
@@ -192,9 +295,13 @@ export default function Home() {
                 ))}
                 {loading && (
                   <div className="flex justify-start">
-                    <div className="rounded-2xl rounded-bl-sm bg-white border border-amber-100 px-4 py-2.5 text-sm text-muted-foreground">
-                      思考中…
-                    </div>
+                    {generating ? (
+                      <ProfileCarousel profile={profile} />
+                    ) : (
+                      <div className="rounded-2xl rounded-bl-sm bg-white border border-amber-100 px-4 py-2.5 text-sm text-muted-foreground">
+                        思考中…
+                      </div>
+                    )}
                   </div>
                 )}
                 <div ref={bottomRef} />
@@ -203,6 +310,15 @@ export default function Home() {
           </Card>
 
           {error && <p className="text-sm text-red-600 bg-red-50 rounded-lg px-3 py-2">{error}</p>}
+
+          {/* 生成方案提醒 */}
+          {showReminder && (
+            <div className="flex items-center justify-between gap-3 rounded-xl border-2 border-emerald-300 bg-emerald-50 px-4 py-3">
+              <span className="text-sm text-emerald-800">
+                ✅ 你的需求已经够清楚啦，点击右侧「生成方案」按钮，我马上为你定制！
+              </span>
+            </div>
+          )}
 
           {/* 快捷选项：点选暂存进输入框，可组合编辑 */}
           {!loading && lastAssistant?.options && lastAssistant.options.length > 0 && (
@@ -245,8 +361,8 @@ export default function Home() {
                 variant="outline"
                 onClick={generatePlan}
                 disabled={!hasKey || loading || turns.length < 3}
-                className={readyForPlan ? 'border-emerald-500 text-emerald-600' : ''}
-                title={readyForPlan ? '信息已足够，可以生成方案' : '也可以随时提前生成（会基于现有信息）'}
+                className={showReminder ? 'border-emerald-500 text-emerald-600 animate-pulse' : ''}
+                title={readyForPlan ? '信息已足够，点击生成方案' : '也可以随时提前生成（会基于现有信息）'}
               >
                 生成方案
               </Button>
@@ -254,30 +370,54 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 右：画像 + 方案 */}
+        {/* 右：画像 + 方案入口 */}
         <div className="flex flex-col gap-4">
           <ProfilePanel profile={profile} />
           {plan && (
             <Card className="border-emerald-200 bg-white/80">
               <CardHeader className="pb-2">
                 <CardTitle className="text-base flex items-center justify-between">
-                  <span>🗺️ 你的定制旅行方案</span>
-                  {planVersion > 0 && (
-                    <span className="text-xs font-normal text-emerald-600">v{planVersion}</span>
-                  )}
+                  <span>✅ 方案已生成</span>
+                  <span className="text-xs font-normal text-emerald-600">v{planVersion}</span>
                 </CardTitle>
               </CardHeader>
-              <CardContent>
-                <ScrollArea className="h-[40vh] pr-3">
-                  <div className="prose prose-sm max-w-none">
-                    <ReactMarkdown>{plan}</ReactMarkdown>
-                  </div>
-                </ScrollArea>
+              <CardContent className="space-y-3">
+                <p className="text-sm text-muted-foreground">
+                  {destination ? `${destination}的` : '你的'}定制方案已保存为网页，可查看、下载，也可继续对话调整。
+                </p>
+                <Button
+                  className="w-full"
+                  disabled={!currentArchiveId}
+                  onClick={() => currentArchiveId && setViewerUrl(planHtmlUrl(currentArchiveId))}
+                >
+                  🗺️ 查看完整方案
+                </Button>
+                <Button
+                  variant="outline"
+                  className="w-full"
+                  disabled={!currentArchiveId}
+                  onClick={() => currentArchiveId && window.open(planHtmlUrl(currentArchiveId), '_blank')}
+                >
+                  ↗ 新窗口打开
+                </Button>
               </CardContent>
             </Card>
           )}
         </div>
       </main>
+
+      <PlanViewer
+        htmlUrl={viewerUrl}
+        destination={destination}
+        planVersion={planVersion}
+        onClose={() => setViewerUrl(null)}
+      />
+      <HistoryDrawer
+        open={historyOpen}
+        onOpenChange={setHistoryOpen}
+        onView={viewArchive}
+        onContinue={continuePlan}
+      />
     </div>
   )
 }

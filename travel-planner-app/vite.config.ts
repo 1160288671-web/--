@@ -9,7 +9,7 @@ export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, __dirname, '')
   return {
     base: './',
-    plugins: [inspectAttr(), react(), travelApiPlugin(env)],
+    plugins: [inspectAttr(), react(), travelApiPlugin(env, __dirname)],
     server: {
       port: 3000,
     },

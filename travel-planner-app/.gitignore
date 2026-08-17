@@ -23,3 +23,6 @@ dist-ssr
 *.sln
 *.sw?
 .env
+
+# 生成的旅行方案存档（HTML + 用户档案 JSON）
+server/data/plans/

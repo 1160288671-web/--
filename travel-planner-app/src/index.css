@@ -73,3 +73,18 @@
     @apply bg-background text-foreground;
   }
 }
+
+@keyframes profile-pop {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.animate-profile-pop {
+  animation: profile-pop 0.4s ease;
+}
