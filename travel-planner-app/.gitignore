@@ -26,3 +26,6 @@ dist-ssr
 
 # 生成的旅行方案存档（HTML + 用户档案 JSON）
 server/data/plans/
+
+# npm 本地缓存（由 start.ps1 重定向到项目内，避免 D 盘沙箱限制）
+.npm-cache/
